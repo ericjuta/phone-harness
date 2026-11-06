@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal Streamable-HTTP MCP server driving the local Pixel via phone-harness/adb.
+"""Streamable-HTTP MCP server driving the local Pixel via phone-harness/adb.
 
 Bearer token from ~/.config/phone-mcp/token. Listens on 127.0.0.1:8931, path /mcp.
+Read tools carry readOnlyHint; everything else changes the phone.
 """
-import hmac, json, os, subprocess
+import base64, hmac, io, json, os, re, shlex, subprocess, time
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = open(os.path.expanduser("~/.config/phone-mcp/token")).read().strip()
@@ -11,43 +14,197 @@ PH = os.path.expanduser("~/.local/bin/phone-harness")
 PORT = int(os.environ.get("PHONE_MCP_PORT", "8931"))
 
 
-def ph(script: str, timeout=60) -> str:
-    r = subprocess.run([PH], input=script, capture_output=True, text=True, timeout=timeout)
-    out = (r.stdout + r.stderr).strip()
+def run(cmd, timeout=30, data=None) -> subprocess.CompletedProcess:
+    r = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout, text=data is None or isinstance(data, str))
     if r.returncode:
-        raise RuntimeError(out or f"phone-harness exit {r.returncode}")
-    return out
+        err = (r.stdout + r.stderr) if isinstance(r.stdout, str) else (r.stdout + r.stderr).decode(errors="replace")
+        if "no devices" in err or "device offline" in err:
+            err += "\nPhone not connected: re-enable Wireless debugging and run `phone-harness android connect IP:PORT`."
+        raise RuntimeError(err.strip() or f"{cmd[0]} exit {r.returncode}")
+    return r
+
+
+def ph(script: str, timeout=90) -> str:
+    return run([PH], timeout, script).stdout.strip()
 
 
 def adb(*args, timeout=30) -> str:
-    r = subprocess.run(["adb", "shell", *args], capture_output=True, text=True, timeout=timeout)
-    if r.returncode:
-        raise RuntimeError((r.stdout + r.stderr).strip())
-    return r.stdout.strip() or "ok"
+    """Run a device shell command; each arg is quoted for the device shell."""
+    return run(["adb", "shell", " ".join(shlex.quote(str(a)) for a in args)], timeout).stdout.strip()
 
 
-S = {"type": "object"}
-TOOLS = {
-    "phone_screen": ("List visible text with boxes and the foreground app.", {**S, "properties": {}},
-                     lambda a: ph('import json\nprint(current_app())\nfor b in screen(): print(json.dumps(b))')),
-    "phone_open_app": ("Open an app by name.", {**S, "properties": {"name": {"type": "string"}}, "required": ["name"]},
-                       lambda a: open_app(a["name"])),
-    "phone_open_url": ("Open a URL or deep link (optionally in a package).",
-                       {**S, "properties": {"url": {"type": "string"}, "package": {"type": "string"}}, "required": ["url"]},
-                       lambda a: adb("am", "start", "-a", "android.intent.action.VIEW", "-d", "'" + a["url"].replace("'", "") + "'",
-                                     *(["-p", a["package"]] if a.get("package") else []))),
-    "phone_tap_text": ("Tap visible text.", {**S, "properties": {"text": {"type": "string"}}, "required": ["text"]},
-                       lambda a: ph(f"print(tap_text({a['text']!r}))")),
-    "phone_tap": ("Tap at pixel coordinates.", {**S, "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]},
-                  lambda a: adb("input", "tap", str(int(a["x"])), str(int(a["y"])))),
-    "phone_type_text": ("Type text into the focused field.", {**S, "properties": {"text": {"type": "string"}}, "required": ["text"]},
-                        lambda a: ph(f"print(type_text({a['text']!r}))")),
-    "phone_press": ("Press a key: enter, back, home.", {**S, "properties": {"key": {"type": "string", "enum": ["enter", "back", "home"]}}, "required": ["key"]},
-                    lambda a: adb("input", "keyevent", {"enter": "66", "back": "4", "home": "3"}[a["key"]])),
-    "phone_swipe": ("Swipe between two points.", {**S, "properties": {k: {"type": "integer"} for k in ("x1", "y1", "x2", "y2")}, "required": ["x1", "y1", "x2", "y2"]},
-                    lambda a: adb("input", "swipe", *(str(int(a[k])) for k in ("x1", "y1", "x2", "y2")), "300")),
-}
+def ms(t) -> str:
+    return datetime.fromtimestamp(int(t) / 1000).isoformat(timespec="seconds") if str(t).isdigit() else t
 
+
+def q(s: str) -> str:
+    return s.replace("'", "''")
+
+
+# ---- reads -------------------------------------------------------------------
+
+def screenshot(max_size=1280, quality=70):
+    # Foldables have two panels and screencap defaults to the first; capture the one that is on.
+    states = re.findall(r"mUniqueId=local:(\d+)\s+mState=(\w+)", adb("dumpsys", "display", timeout=40))
+    on = [d for d, s in states if s == "ON"]
+    png = run(["adb", "exec-out", "screencap", "-p", *(["-d", on[0]] if on else [])], 30, b"").stdout
+    png = png[png.find(b"\x89PNG"):]  # drop any multiple-displays warning
+    from PIL import Image
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    w, h = im.size
+    im.thumbnail((max_size, max_size))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=quality)
+    return [{"type": "image", "data": base64.b64encode(buf.getvalue()).decode(), "mimeType": "image/jpeg"},
+            {"type": "text", "text": f"screen {w}x{h}, image {im.size[0]}x{im.size[1]}; scale taps by {w / im.size[0]:.3f}"}]
+
+
+def ui_tree(all_nodes=False):
+    adb("uiautomator", "dump", "/sdcard/.phone-mcp-ui.xml", timeout=40)
+    root = ET.fromstring(adb("cat", "/sdcard/.phone-mcp-ui.xml"))
+    out = []
+    for n in root.iter("node"):
+        a = n.attrib
+        text, desc, rid = a.get("text", ""), a.get("content-desc", ""), a.get("resource-id", "").split("/")[-1]
+        flags = [f for f in ("clickable", "scrollable", "checkable", "checked", "focused", "selected", "long-clickable") if a.get(f) == "true"]
+        if not (all_nodes or text or desc or "clickable" in flags or "scrollable" in flags):
+            continue
+        x1, y1, x2, y2 = map(int, re.findall(r"\d+", a.get("bounds", "[0,0][0,0]")))
+        out.append(json.dumps({k: v for k, v in {"text": text, "desc": desc, "id": rid, "class": a.get("class", "").rsplit(".", 1)[-1],
+                                                 "flags": flags, "x": (x1 + x2) // 2, "y": (y1 + y2) // 2,
+                                                 "bounds": [x1, y1, x2, y2]}.items() if v}, ensure_ascii=False))
+    return f"{root[0].attrib.get('package', '?') if len(root) else '?'}\n" + "\n".join(out)
+
+
+FIELD = re.compile(r"^\s+android\.(title|text|bigText|subText|conversationTitle)=String \((.*)$")
+
+
+def notifications(package=None, limit=30):
+    out = run(["adb", "shell", "dumpsys notification --noredact"], 60).stdout
+    section = out.split("  Notification List:", 1)[-1].split("\n  mMaxPackageEnqueueRate", 1)[0]
+    recs = []
+    for block in section.split("NotificationRecord(")[1:]:
+        pkg = re.search(r"pkg=(\S+)", block).group(1)
+        if package and package not in pkg:
+            continue
+        when, key = re.search(r"\bwhen=(\d+)", block), re.search(r"\bkey=(\S+?):", block)
+        rec = {"package": pkg, "time": ms(when.group(1)) if when else None, "key": key.group(1) if key else None}
+        lines = block.splitlines()
+        for i, line in enumerate(lines):
+            m = FIELD.match(line)
+            if not m or m.group(1) in rec:
+                continue
+            val, j = m.group(2), i
+            while not val.endswith(")") and j + 1 < len(lines):  # multi-line string value
+                j += 1
+                val += "\n" + lines[j]
+            rec[m.group(1)] = val[:-1][:2000]
+        msgs = re.findall(r"android\.messages=.*?\]", block, re.S)
+        if msgs:
+            rec["messages"] = re.findall(r"text=(.*?)(?:, sender|\}|$)", msgs[0], re.M)[-10:] or None
+        if any(k in rec for k in ("title", "text", "messages")):
+            if len(rec.get("bigText", "")) > len(rec.get("text", "")):
+                rec["text"] = rec["bigText"]
+            rec.pop("bigText", None)
+            recs.append({k: v for k, v in rec.items() if v})
+    recs.sort(key=lambda r: r.get("time") or "", reverse=True)
+    return "\n".join(json.dumps(r, ensure_ascii=False) for r in recs[:limit]) or "no notifications"
+
+
+def content_query(uri, projection=None, where=None, sort=None, limit=50):
+    """Rows of an Android content provider as dicts (column names from projection or the rows)."""
+    args = ["content", "query", "--uri", uri]
+    if projection:
+        args += ["--projection", ":".join(projection)]
+    if where:
+        args += ["--where", where]
+    if sort:
+        args += ["--sort", sort]
+    raw = adb(*args, timeout=60)
+    rows = re.split(r"(?:^|\n)Row: \d+ ", raw)[1:]
+    out = []
+    for row in rows[:limit]:
+        cols = projection or re.findall(r"(?:^|, )([\w.]+)=", row)
+        pat = "|".join(re.escape(c) for c in cols)
+        parts = re.split(rf"(?:^|, )({pat})=", row)[1:]
+        out.append({k: (None if v == "NULL" else v) for k, v in zip(parts[::2], parts[1::2])})
+    if not out and raw and not raw.startswith("No result"):
+        raise RuntimeError(raw)
+    return out
+
+
+def jl(rows):
+    return "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) or "none"
+
+
+def sms(box="inbox", search=None, limit=20):
+    where = f"body LIKE '%{q(search)}%' OR address LIKE '%{q(search)}%'" if search else None
+    rows = content_query(f"content://sms/{'' if box == 'all' else box}".rstrip("/"),
+                         ["_id", "thread_id", "address", "date", "type", "read", "body"], where, "date DESC", limit)
+    for r in rows:
+        r["date"] = ms(r["date"]); r["type"] = {"1": "in", "2": "out"}.get(r["type"], r["type"])
+    return jl(rows)
+
+
+def call_log(limit=20):
+    rows = content_query("content://call_log/calls", ["number", "name", "date", "duration", "type"], None, "date DESC", limit)
+    for r in rows:
+        r["date"] = ms(r["date"]); r["type"] = {"1": "in", "2": "out", "3": "missed", "4": "voicemail", "5": "rejected", "6": "blocked"}.get(r["type"], r["type"])
+    return jl(rows)
+
+
+def contacts(search=None, limit=50):
+    where = "mimetype IN ('vnd.android.cursor.item/phone_v2','vnd.android.cursor.item/email_v2')"
+    if search:
+        where += f" AND (display_name LIKE '%{q(search)}%' OR data1 LIKE '%{q(search)}%')"
+    people = {}
+    for r in content_query("content://com.android.contacts/data", ["display_name", "mimetype", "data1"], where, "display_name ASC", 5000):
+        p = people.setdefault(r["display_name"], {"name": r["display_name"], "phones": [], "emails": []})
+        p["phones" if r["mimetype"].endswith("phone_v2") else "emails"].append(r["data1"])
+    return jl(list(people.values())[:limit])
+
+
+def calendar(days=7, past_days=0, limit=50):
+    now = int(time.time() * 1000)
+    rows = content_query(f"content://com.android.calendar/instances/when/{now - past_days * 86400000}/{now + days * 86400000}",
+                         ["title", "begin", "end", "allDay", "eventLocation", "calendar_displayName"], None, "begin ASC", limit)
+    for r in rows:
+        r["begin"], r["end"] = ms(r["begin"]), ms(r["end"])
+    return jl(rows)
+
+
+def location():
+    dump = adb("dumpsys", "location", timeout=40)
+    fixes = re.findall(r"last location=Location\[(\w+) (-?[\d.]+),(-?[\d.]+) hAcc=([\d.]+)", dump)
+    if not fixes:
+        return "no last known location"
+    prov, lat, lon, acc = sorted(fixes, key=lambda f: (f[0] != "fused", float(f[3])))[0]
+    return json.dumps({"lat": float(lat), "lon": float(lon), "accuracy_m": round(float(acc), 1), "provider": prov,
+                       "maps": f"https://maps.google.com/?q={lat},{lon}"})
+
+
+def device_info():
+    sh = lambda c: run(["adb", "shell", c], 40).stdout
+    batt = dict(re.findall(r"^\s+(level|status|temperature|AC powered|USB powered|Wireless powered): (\S+)", sh("dumpsys battery"), re.M))
+    focus = re.search(r"topResumedActivity=.*? (\S+)/", sh("dumpsys activity activities | grep -m1 topResumedActivity"))
+    return json.dumps({
+        "model": sh("getprop ro.product.model").strip(), "android": sh("getprop ro.build.version.release").strip(),
+        "battery_pct": int(batt.get("level", -1)), "charging": "true" in (batt.get("AC powered"), batt.get("USB powered"), batt.get("Wireless powered")),
+        "battery_temp_c": int(batt.get("temperature", 0)) / 10,
+        "screen": (re.search(r"mWakefulness=(\w+)", sh("dumpsys power | grep -m1 mWakefulness=")) or [None, "?"])[1],
+        "locked": "isKeyguardShowing=true" in sh("dumpsys window | grep -m1 isKeyguardShowing"),
+        "foreground": focus.group(1) if focus else None,
+        "wifi": sh("cmd wifi status | grep -m1 -E 'connected to|Wifi is'").strip(),
+        "size": sh("wm size").split(":")[-1].strip(),
+    })
+
+
+def list_apps(search=None, third_party=False):
+    pkgs = sorted(l.removeprefix("package:") for l in adb("pm", "list", "packages", *(["-3"] if third_party else [])).splitlines())
+    return "\n".join(p for p in pkgs if not search or search.lower() in p.lower())
+
+
+# ---- actions -----------------------------------------------------------------
 
 def open_app(name: str) -> str:
     """Launch by package or name; phone-harness open_app relies on the stock launcher's search."""
@@ -63,22 +220,120 @@ def open_app(name: str) -> str:
     adb("monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1")
     return pkg
 
+
+KEYS = {"enter": "ENTER", "back": "BACK", "home": "HOME", "recents": "APP_SWITCH", "power": "POWER", "wake": "WAKEUP",
+        "sleep": "SLEEP", "volume_up": "VOLUME_UP", "volume_down": "VOLUME_DOWN", "mute": "VOLUME_MUTE",
+        "play_pause": "MEDIA_PLAY_PAUSE", "next": "MEDIA_NEXT", "previous": "MEDIA_PREVIOUS", "delete": "DEL",
+        "tab": "TAB", "search": "SEARCH", "menu": "MENU", "camera": "CAMERA", "escape": "ESCAPE"}
+
+
+def press(key: str, long=False):
+    code = KEYS.get(key.lower(), key.upper().removeprefix("KEYCODE_"))
+    return adb("input", "keyevent", *(["--longpress"] if long else []), code if code.isdigit() else "KEYCODE_" + code) or "ok"
+
+
+def intent(action=None, data=None, package=None, component=None, mime=None, extras=None, kind="activity"):
+    args = ["am", {"activity": "start", "broadcast": "broadcast", "service": "start-foreground-service"}[kind]]
+    for flag, v in (("-a", action), ("-d", data), ("-p", package), ("-n", component), ("-t", mime)):
+        if v:
+            args += [flag, v]
+    for k, v in (extras or {}).items():
+        args += [{bool: "--ez", int: "--ei", float: "--ef"}.get(type(v), "--es"), k, str(v).lower() if isinstance(v, bool) else str(v)]
+    return adb(*args) or "ok"
+
+
+# ---- tool table --------------------------------------------------------------
+
+S, STR, INT, BOOL = {"type": "object"}, {"type": "string"}, {"type": "integer"}, {"type": "boolean"}
+
+
+def obj(req=(), **props):
+    return {**S, "properties": props, "required": list(req)}
+
+
+READ = {
+    "phone_screen": ("Visible text with tap boxes (accessibility tree + OCR) and the foreground app. Cheapest way to see the screen.",
+                     obj(), lambda a: ph('import json\nprint(current_app())\nfor b in screen(): print(json.dumps(b))')),
+    "phone_ui_tree": ("UI hierarchy via uiautomator: text, content-desc, resource id, class, flags (clickable/scrollable/checked...), centre x,y, bounds. Sees unlabeled clickable views phone_screen misses.",
+                      obj(all_nodes={**BOOL, "description": "include non-interactive empty nodes"}), lambda a: ui_tree(bool(a.get("all_nodes")))),
+    "phone_screenshot": ("JPEG screenshot (works on lock screen). Coordinates in the image must be scaled by the returned factor before tapping.",
+                         obj(max_size={**INT, "description": "longest edge px, default 1280"}, quality=INT),
+                         lambda a: screenshot(int(a.get("max_size") or 1280), int(a.get("quality") or 70))),
+    "phone_wait_for_text": ("Wait until text is visible; returns its box or null.", obj(["text"], text=STR, timeout={**INT, "description": "seconds, default 10"}),
+                            lambda a: ph(f"import json\nprint(json.dumps(wait_for_text({a['text']!r}, timeout={float(a.get('timeout') or 10)})))", 120)),
+    "phone_notifications": ("Current notifications, newest first: package, time, title, text, messaging lines, key.",
+                            obj(package={**STR, "description": "substring filter"}, limit=INT),
+                            lambda a: notifications(a.get("package"), int(a.get("limit") or 30))),
+    "phone_sms": ("Read SMS messages, newest first.", obj(box={**STR, "enum": ["inbox", "sent", "all"]}, search=STR, limit=INT),
+                  lambda a: sms(a.get("box") or "inbox", a.get("search"), int(a.get("limit") or 20))),
+    "phone_call_log": ("Recent calls, newest first.", obj(limit=INT), lambda a: call_log(int(a.get("limit") or 20))),
+    "phone_contacts": ("Contacts with phone numbers and emails.", obj(search=STR, limit=INT),
+                       lambda a: contacts(a.get("search"), int(a.get("limit") or 50))),
+    "phone_calendar": ("Calendar event instances in a window around now.", obj(days={**INT, "description": "ahead, default 7"}, past_days=INT, limit=INT),
+                       lambda a: calendar(int(a.get("days") or 7), int(a.get("past_days") or 0), int(a.get("limit") or 50))),
+    "phone_location": ("Last known location (fused/network/gps) with accuracy and a Maps link.", obj(), lambda a: location()),
+    "phone_device_info": ("Model, Android version, battery, charging, screen awake/locked, foreground app, Wi-Fi, screen size.",
+                          obj(), lambda a: device_info()),
+    "phone_list_apps": ("Installed package names (system apps included unless third_party).", obj(search=STR, third_party=BOOL),
+                        lambda a: list_apps(a.get("search"), bool(a.get("third_party")))),
+    "phone_content_query": ("Query any Android content provider (e.g. content://media/external/images/media, content://settings/system).",
+                            obj(["uri"], uri=STR, projection={"type": "array", "items": STR}, where=STR, sort=STR, limit=INT),
+                            lambda a: jl(content_query(a["uri"], a.get("projection"), a.get("where"), a.get("sort"), int(a.get("limit") or 50)))),
+}
+
+ACT = {
+    "phone_open_app": ("Open an app by name or package.", obj(["name"], name=STR), lambda a: open_app(a["name"])),
+    "phone_open_url": ("Open a URL or deep link (https:, tel:, sms:, mailto:, geo:, app schemes), optionally in a package.",
+                       obj(["url"], url=STR, package=STR), lambda a: intent("android.intent.action.VIEW", a["url"], a.get("package"))),
+    "phone_intent": ("Send an Android intent: start an activity, broadcast or service.",
+                     obj(action=STR, data=STR, package=STR, component={**STR, "description": "pkg/.Activity"}, mime=STR,
+                         extras={**S, "description": "string/int/float/bool extras"}, kind={**STR, "enum": ["activity", "broadcast", "service"]}),
+                     lambda a: intent(a.get("action"), a.get("data"), a.get("package"), a.get("component"), a.get("mime"), a.get("extras"), a.get("kind") or "activity")),
+    "phone_tap_text": ("Tap visible text (OCR/accessibility match).", obj(["text"], text=STR), lambda a: ph(f"print(tap_text({a['text']!r}))")),
+    "phone_tap_ui": ("Tap an accessibility node by text, content-desc or resource id.", obj(["query"], query=STR, index=INT, exact=BOOL),
+                     lambda a: ph(f"print(tap_ui({a['query']!r}, index={int(a.get('index') or 0)}, exact={bool(a.get('exact'))}))")),
+    "phone_tap": ("Tap screen coordinates.", obj(["x", "y"], x=INT, y=INT), lambda a: adb("input", "tap", int(a["x"]), int(a["y"])) or "ok"),
+    "phone_long_press": ("Long-press screen coordinates.", obj(["x", "y"], x=INT, y=INT, ms={**INT, "description": "default 800"}),
+                         lambda a: adb("input", "swipe", *[int(a[k]) for k in ("x", "y", "x", "y")], int(a.get("ms") or 800)) or "ok"),
+    "phone_swipe": ("Swipe between two points.", obj(["x1", "y1", "x2", "y2"], x1=INT, y1=INT, x2=INT, y2=INT, ms={**INT, "description": "default 300"}),
+                    lambda a: adb("input", "swipe", *[int(a[k]) for k in ("x1", "y1", "x2", "y2")], int(a.get("ms") or 300)) or "ok"),
+    "phone_scroll": ("Scroll to reveal content in a direction.", obj(["direction"], direction={**STR, "enum": ["down", "up", "left", "right"]}, amount={"type": "number", "description": "fraction of screen, default 0.4"}),
+                     lambda a: ph(f"scroll({a['direction']!r}, amount={float(a.get('amount') or 0.4)}); print('ok')")),
+    "phone_type_text": ("Type text into the focused field.", obj(["text"], text=STR), lambda a: ph(f"print(type_text({a['text']!r}))")),
+    "phone_press": ("Press a key: " + ", ".join(KEYS) + ", or any Android KEYCODE name/number.", obj(["key"], key=STR, long=BOOL),
+                    lambda a: press(a["key"], bool(a.get("long")))),
+    "phone_statusbar": ("Open or close the notification shade / quick settings.", obj(["action"], action={**STR, "enum": ["expand-notifications", "expand-settings", "collapse"]}),
+                        lambda a: adb("cmd", "statusbar", a["action"]) or "ok"),
+    "phone_shell": ("Run any adb shell command on the phone (sh -c); returns stdout+stderr.", obj(["command"], command=STR, timeout=INT),
+                    lambda a: (lambda r: (r.stdout + r.stderr).strip() + ("" if not r.returncode else f"\n[exit {r.returncode}]"))(
+                        subprocess.run(["adb", "shell", a["command"]], capture_output=True, text=True, timeout=int(a.get("timeout") or 60)))),
+    "phone_harness": ("Run a phone-harness Python script (helpers: screen, ui, tap_ui, tap_text, type_text, press, scroll, scroll_until, wait_for_text, wait_stable, long_press, swipe, shell, ...). Print results.",
+                      obj(["script"], script=STR, timeout={**INT, "description": "seconds, default 120"}),
+                      lambda a: ph(a["script"], int(a.get("timeout") or 120))),
+}
+
+TOOLS = {**{k: (*v, True) for k, v in READ.items()}, **{k: (*v, False) for k, v in ACT.items()}}
+
+
 def handle(msg):
     m, mid, p = msg.get("method"), msg.get("id"), msg.get("params") or {}
     if mid is None:
         return None  # notification
     if m == "initialize":
         res = {"protocolVersion": p.get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}},
-               "serverInfo": {"name": "phone-mcp", "version": "0.1.0"}}
+               "serverInfo": {"name": "phone-mcp", "version": "0.2.0"}}
     elif m == "ping":
         res = {}
     elif m == "tools/list":
-        res = {"tools": [{"name": n, "description": d, "inputSchema": s} for n, (d, s, _) in TOOLS.items()]}
+        res = {"tools": [{"name": n, "description": d, "inputSchema": s,
+                          "annotations": {"readOnlyHint": ro, "destructiveHint": not ro, "openWorldHint": False}}
+                         for n, (d, s, _, ro) in TOOLS.items()]}
     elif m == "tools/call" and p.get("name") in TOOLS:
         try:
-            res = {"content": [{"type": "text", "text": TOOLS[p["name"]][2](p.get("arguments") or {})}]}
+            out = TOOLS[p["name"]][2](p.get("arguments") or {})
+            res = {"content": out if isinstance(out, list) else [{"type": "text", "text": out or "ok"}]}
         except Exception as e:
-            res = {"content": [{"type": "text", "text": str(e)}], "isError": True}
+            res = {"content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}], "isError": True}
     else:
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"unknown {m}"}}
     return {"jsonrpc": "2.0", "id": mid, "result": res}

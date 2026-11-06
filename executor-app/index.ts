@@ -4,6 +4,23 @@ import { mcpHealth, mcpRouter } from "apps/mcp";
 
 const url = "https://arch-phone.your-tailnet.ts.net/mcp";
 
+// Read-only tools (readOnlyHint in bin/phone-mcp) run without approval; everything else asks.
+const READS = [
+  "phone_screen",
+  "phone_ui_tree",
+  "phone_screenshot",
+  "phone_wait_for_text",
+  "phone_notifications",
+  "phone_sms",
+  "phone_call_log",
+  "phone_contacts",
+  "phone_calendar",
+  "phone_location",
+  "phone_device_info",
+  "phone_list_apps",
+  "phone_content_query",
+];
+
 const phone = defineProvider({
   name: "Pixel phone MCP",
   hosts: ["arch-phone.your-tailnet.ts.net"],
@@ -21,8 +38,8 @@ export default defineApp({ app: { accounts: { phone } } }, async ({ app, cache, 
   tools: withApprovals(
     await mcpRouter(
       { url, account: app.accounts.phone, headers: app.accounts.phone.headers(), cache, signal },
-      { phone_screen: "query" },
+      Object.fromEntries(READS.map((name) => [name, "query" as const])),
     ),
-    (_tool, name) => (name === "phone_screen" ? undefined : always()),
+    (_tool, name) => (READS.includes(name) ? undefined : always()),
   ),
 }));
