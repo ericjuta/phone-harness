@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Minimal Streamable-HTTP MCP server driving the local Pixel via phone-harness/adb.
+
+Bearer token from ~/.config/phone-mcp/token. Listens on 127.0.0.1:8931, path /mcp.
+"""
+import hmac, json, os, subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+TOKEN = open(os.path.expanduser("~/.config/phone-mcp/token")).read().strip()
+PH = os.path.expanduser("~/.local/bin/phone-harness")
+PORT = int(os.environ.get("PHONE_MCP_PORT", "8931"))
+
+
+def ph(script: str, timeout=60) -> str:
+    r = subprocess.run([PH], input=script, capture_output=True, text=True, timeout=timeout)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode:
+        raise RuntimeError(out or f"phone-harness exit {r.returncode}")
+    return out
+
+
+def adb(*args, timeout=30) -> str:
+    r = subprocess.run(["adb", "shell", *args], capture_output=True, text=True, timeout=timeout)
+    if r.returncode:
+        raise RuntimeError((r.stdout + r.stderr).strip())
+    return r.stdout.strip() or "ok"
+
+
+S = {"type": "object"}
+TOOLS = {
+    "phone_screen": ("List visible text with boxes and the foreground app.", {**S, "properties": {}},
+                     lambda a: ph('import json\nprint(current_app())\nfor b in screen(): print(json.dumps(b))')),
+    "phone_open_app": ("Open an app by name.", {**S, "properties": {"name": {"type": "string"}}, "required": ["name"]},
+                       lambda a: open_app(a["name"])),
+    "phone_open_url": ("Open a URL or deep link (optionally in a package).",
+                       {**S, "properties": {"url": {"type": "string"}, "package": {"type": "string"}}, "required": ["url"]},
+                       lambda a: adb("am", "start", "-a", "android.intent.action.VIEW", "-d", "'" + a["url"].replace("'", "") + "'",
+                                     *(["-p", a["package"]] if a.get("package") else []))),
+    "phone_tap_text": ("Tap visible text.", {**S, "properties": {"text": {"type": "string"}}, "required": ["text"]},
+                       lambda a: ph(f"print(tap_text({a['text']!r}))")),
+    "phone_tap": ("Tap at pixel coordinates.", {**S, "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]},
+                  lambda a: adb("input", "tap", str(int(a["x"])), str(int(a["y"])))),
+    "phone_type_text": ("Type text into the focused field.", {**S, "properties": {"text": {"type": "string"}}, "required": ["text"]},
+                        lambda a: ph(f"print(type_text({a['text']!r}))")),
+    "phone_press": ("Press a key: enter, back, home.", {**S, "properties": {"key": {"type": "string", "enum": ["enter", "back", "home"]}}, "required": ["key"]},
+                    lambda a: adb("input", "keyevent", {"enter": "66", "back": "4", "home": "3"}[a["key"]])),
+    "phone_swipe": ("Swipe between two points.", {**S, "properties": {k: {"type": "integer"} for k in ("x1", "y1", "x2", "y2")}, "required": ["x1", "y1", "x2", "y2"]},
+                    lambda a: adb("input", "swipe", *(str(int(a[k])) for k in ("x1", "y1", "x2", "y2")), "300")),
+}
+
+
+def open_app(name: str) -> str:
+    """Launch by package or name; phone-harness open_app relies on the stock launcher's search."""
+    key = name.lower().replace(" ", "")
+    pkgs = [l.removeprefix("package:").strip() for l in adb("pm", "list", "packages").splitlines()]
+    if name in pkgs:
+        pkg = name
+    else:
+        hits = [p for p in pkgs if p.rsplit(".", 1)[-1] == key] or [p for p in pkgs if key in p.lower()]
+        if not hits:
+            raise RuntimeError(f"no installed package matches {name!r}")
+        pkg = min(hits, key=len)
+    adb("monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1")
+    return pkg
+
+def handle(msg):
+    m, mid, p = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if mid is None:
+        return None  # notification
+    if m == "initialize":
+        res = {"protocolVersion": p.get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}},
+               "serverInfo": {"name": "phone-mcp", "version": "0.1.0"}}
+    elif m == "ping":
+        res = {}
+    elif m == "tools/list":
+        res = {"tools": [{"name": n, "description": d, "inputSchema": s} for n, (d, s, _) in TOOLS.items()]}
+    elif m == "tools/call" and p.get("name") in TOOLS:
+        try:
+            res = {"content": [{"type": "text", "text": TOOLS[p["name"]][2](p.get("arguments") or {})}]}
+        except Exception as e:
+            res = {"content": [{"type": "text", "text": str(e)}], "isError": True}
+    else:
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"unknown {m}"}}
+    return {"jsonrpc": "2.0", "id": mid, "result": res}
+
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, code, body=None):
+        data = json.dumps(body).encode() if body is not None else b""
+        self.send_response(code)
+        if body is not None:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _ok(self):
+        auth = self.headers.get("Authorization", "")
+        if self.path.split("?")[0] != "/mcp":
+            self._send(404); return False
+        if not hmac.compare_digest(auth, f"Bearer {TOKEN}"):
+            self._send(401, {"error": "unauthorized"}); return False
+        return True
+
+    def do_POST(self):
+        if not self._ok():
+            return
+        msg = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"null")
+        out = [r for r in map(handle, msg) if r] if isinstance(msg, list) else handle(msg)
+        self._send(202) if not out else self._send(200, out)
+
+    def do_GET(self):
+        if self._ok():
+            self._send(405)
+
+    def do_DELETE(self):
+        if self._ok():
+            self._send(405)
+
+    def log_message(self, *a):
+        pass
+
+
+ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
